@@ -1,558 +1,6 @@
 <!DOCTYPE html>
-<html lang="en"><head>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        const RealURL = URL;
-        const realDecodeURIComponent = decodeURIComponent;
-        const RealTextEncoder = TextEncoder;
-        const realAtob = atob;
-        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
-        // parser-blocking tag. Native fetch, captured before the proxy override below.
-        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
-        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
-        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
-        let htmlToImageLoad = null;
-        const loadHtmlToImage = () => {
-          if (!htmlToImageLoad) {
-            htmlToImageLoad = (realFetch
-              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
-              : Promise.reject(new Error('fetch unavailable'))
-            )
-              .then((res) => {
-                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
-                return res.text();
-              })
-              .then((source) => {
-                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
-                // window-global branch; inline script text runs synchronously on insert.
-                const hidden = ['define', 'module', 'exports'].map((k) => {
-                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
-                  try { window[k] = undefined; } catch (e) {}
-                  return entry;
-                });
-                try {
-                  const el = document.createElement('script');
-                  el.text = source;
-                  (document.head || document.documentElement).appendChild(el);
-                } finally {
-                  hidden.forEach(({ k, own, v }) => {
-                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
-                  });
-                }
-                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
-                return window.htmlToImage;
-              });
-            // A failed load may be transient; let the next screenshot retry.
-            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
-          }
-          return htmlToImageLoad;
-        };
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
-        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
-        let storageReadsOut = 0;
-        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-              storageReadsOut += 1;
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-              storageReadsOut += 1;
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures and toPng errors so the parent always
-            // gets a response instead of hanging forever.
-            try {
-              const htmlToImage = await loadHtmlToImage();
-              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
-              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
-              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                ...(rootElement.offsetHeight > previewHeight && {
-                  height: previewHeight,
-                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
-                }),
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            storageReadsOut -= 1;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            storageReadsOut -= 1;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
-        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
-        const resolvedHref = (linkEl) => {
-          if (typeof linkEl.href === "string") return linkEl.href;
-          const written = linkEl.href?.baseVal;
-          // A same-document SVG link, such as one that begins an animation, stays with the browser.
-          if (!written || written.trim().startsWith("#")) return "";
-          try {
-            return new RealURL(written, linkEl.baseURI).href;
-          } catch (error) {
-            return written;
-          }
-        };
-
-        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
-        // page and would load that page in the frame instead of scrolling.
-        const sameDocumentFragment = (linkEl) => {
-          const written = linkEl.getAttribute("href")?.trim();
-          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
-          return written.slice(1);
-        };
-
-        const scrollToFragment = (fragment) => {
-          let decoded = fragment;
-          try {
-            decoded = realDecodeURIComponent(fragment);
-          } catch (error) {}
-          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
-          for (const named of target ? [] : document.getElementsByName(decoded)) {
-            if (named.localName === "a") {
-              target = named;
-              break;
-            }
-          }
-          if (target) {
-            target.scrollIntoView();
-          } else if (decoded.toLowerCase() === "top") {
-            window.scrollTo(0, 0);
-          } else {
-            return false;
-          }
-          return true;
-        };
-
-        // Same decoder as dataUrlFile in app/page.tsx; change both together.
-        const hexPair = /^[0-9a-f]{2}$/i;
-        const dataUrlFile = (href) => {
-          const hash = href.indexOf("#");
-          const url = hash === -1 ? href : href.slice(0, hash);
-          const comma = url.indexOf(",");
-          if (comma === -1) return null;
-          const header = url.slice(0, comma);
-          const payload = url.slice(comma + 1);
-          const mimeMatch = header.match(/data:([^;]+)/);
-          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-          const declaredBase64 = header
-            .split(";")
-            .slice(1)
-            .some((param) => param.trim().toLowerCase() === "base64");
-          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
-          const binaryType = type !== "" && !type.startsWith("text/");
-          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
-            let binary = null;
-            try {
-              binary = realAtob(
-                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
-              );
-            } catch (error) {
-              if (declaredBase64) return null;
-            }
-            if (binary !== null) {
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) {
-                bytes[i] = binary.charCodeAt(i);
-              }
-              return { mimeType, data: bytes.buffer };
-            }
-          }
-          const input = new RealTextEncoder().encode(payload);
-          const bytes = new Uint8Array(input.length);
-          let length = 0;
-          for (let i = 0; i < input.length; i++) {
-            if (input[i] === 0x25 && i + 2 < input.length) {
-              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
-              if (hexPair.test(pair)) {
-                bytes[length++] = parseInt(pair, 16);
-                i += 2;
-                continue;
-              }
-            }
-            bytes[length++] = input[i];
-          }
-          return { mimeType, data: bytes.slice(0, length).buffer };
-        };
-
-        const onLinkClick = (event) => {
-          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
-          if (typeof event.target?.closest !== "function") return;
-    
-          const linkEl = event.target.closest("a");
-          const href = linkEl && resolvedHref(linkEl);
-          if (!href) return;
-
-          const fragment = sameDocumentFragment(linkEl);
-          if (fragment !== null) {
-            const handledByArtifact = event.defaultPrevented;
-            event.preventDefault();
-            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
-            // A fragment that names nothing in the artifact may name something in the host,
-            // such as a project thread. The artifact's own listeners still see the click.
-            realParent.postMessage({ type: 'openExternal', href }, '*');
-            return;
-          }
-          const filename = linkEl.getAttribute("download") ?? "";
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (href.startsWith("data:")) {
-            const file = dataUrlFile(href);
-            if (!file) return;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename,
-              data: file.data,
-              mimeType: file.mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href,
-            }, '*');
-          }
-        };
-        window.addEventListener('click', onLinkClick);
-
-        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
-        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
-        const RealAnchor = window.HTMLAnchorElement;
-        const RealMouseEvent = window.MouseEvent;
-        const anchorProto = RealAnchor?.prototype;
-        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
-        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
-          const onMissedClick = (event) => {
-            if (!event.defaultPrevented) onLinkClick(event);
-          };
-          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
-          const listening = new WeakSet();
-          const callHearingMissed = (anchor, bubbles, call) => {
-            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
-              return call();
-            }
-            listening.add(anchor);
-            anchor.addEventListener('click', onMissedClick);
-            try {
-              return call();
-            } finally {
-              listening.delete(anchor);
-              anchor.removeEventListener('click', onMissedClick);
-            }
-          };
-          anchorProto.click = function () {
-            return callHearingMissed(this, true, () => superProto.click.call(this));
-          };
-          anchorProto.dispatchEvent = function (event) {
-            const call = () => superProto.dispatchEvent.call(this, event);
-            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
-          };
-        }
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-
-        try {
-          (() => {
-            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
-            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
-          })();
-        } catch (e) {}
-
-        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
-        (() => {
-          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
-          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
-        })();
-      })();
-    </script>
-  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><style id="claude-safe-area">body{border-bottom:env(safe-area-inset-bottom,0px) solid transparent}</style>
+<html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Capitola Storm Risk — 10-Day Heat Map</title>
@@ -607,7 +55,7 @@
   a{color:#8cc4ff}
 </style>
 </head>
-<body id="artifacts-component-root-html">
+<body>
 <header>
   <h1>Capitola / Santa Cruz — Storm Risk</h1>
   <div class="sub" id="updated">Loading forecast…</div>
@@ -647,6 +95,9 @@
   </ul>
 </div>
 
+<script>
+window.addEventListener("error",e=>{const b=document.getElementById("banner"); if(b){b.className="banner sample"; b.textContent="Script error: "+e.message+" (line "+e.lineno+")";}});
+</script>
 <script>
 const LAT = 36.9719, LON = -121.953;          // Capitola Village
 const MLAT = 36.95,  MLON = -121.95;          // just offshore, for wave model
@@ -706,7 +157,11 @@ function compass(deg){
 function ymd(d){ return d.toISOString().slice(0,10); }
 
 // ---------- live data ----------
-async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(r.status); return r.json(); }
+async function getJSON(url){
+  const ctl = new AbortController(); const tm = setTimeout(()=>ctl.abort(), 15000);
+  try{ const r = await fetch(url,{signal:ctl.signal}); if(!r.ok) throw new Error("HTTP "+r.status); return await r.json(); }
+  finally{ clearTimeout(tm); }
+}
 
 async function loadLive(){
   const wx = await getJSON(`https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}`+
@@ -862,20 +317,42 @@ async function init(){
     banner.textContent="Live forecast loaded. Tides: "+state.tideSrc+".";
     up.textContent="Updated "+new Date().toLocaleString("en-US",{weekday:"short",hour:"numeric",minute:"2-digit"})+" · Capitola Village, 36.97°N 121.95°W";
   }catch(e){
+    console.warn(e); window.__lastErr = String(e && e.message || e);
     state = sampleData();
     banner.className="banner sample";
-    banner.innerHTML="<b>Sample data</b>: this viewer blocks live data requests, so an example storm is shown. Open this file directly in Safari or Chrome to load the real forecast.";
+    banner.innerHTML="<b>Sample data</b>: this viewer blocks live data requests, so an example storm is shown. Open this file directly in Safari or Chrome to load the real forecast."+(window.__lastErr? " <span style='opacity:.7'>(reason: "+window.__lastErr+")</span>":"");
     up.textContent="Sample storm scenario · layout preview";
   }
   render();
 }
-const SOURCE = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+const SOURCE_FALLBACK = (()=>{
+  // Rebuild a clean copy, dropping anything the hosting page injected.
+  const root = document.documentElement.cloneNode(true);
+  const head = root.querySelector("head"), body = root.querySelector("body");
+  [...head.children].forEach(el=>{
+    const ok = (el.tagName==="META" && (el.hasAttribute("charset") || el.getAttribute("name")==="viewport")) ||
+               el.tagName==="TITLE" || (el.tagName==="STYLE" && el.textContent.includes("--r5"));
+    if(!ok) el.remove();
+  });
+  [...body.children].forEach(el=>{
+    const ok = el.tagName==="HEADER" || ["banner","detail"].includes(el.id) ||
+      (el.tagName==="DIV" && ["bar","legend","wrap","notes"].includes(el.className)) ||
+      (el.tagName==="SCRIPT" && (el.textContent.includes("TIDE_STATION") || el.textContent.includes("Script error")));
+    if(!ok) el.remove();
+  });
+  root.querySelectorAll("*").forEach(el=>[...el.attributes].forEach(a=>{ if(/^data-claude|^data-artifact/.test(a.name)) el.removeAttribute(a.name); }));
+  return "<!DOCTYPE html>\n" + root.outerHTML;
+})();
+let SOURCE = null;
+fetch("index.html").then(r=>r.ok?r.text():null).then(t=>{ if(t && t.includes("Capitola")) SOURCE=t; }).catch(()=>{});
 document.getElementById("copycode").addEventListener("click", async e=>{
   const b=e.currentTarget;
-  try{ await navigator.clipboard.writeText(SOURCE); b.textContent="Copied ✓"; }
+  try{ await navigator.clipboard.writeText(SOURCE || SOURCE_FALLBACK); b.textContent="Copied ✓"; }
   catch(err){ b.textContent="Copy blocked"; }
   setTimeout(()=>b.textContent="Copy tool code",2500);
 });
 document.getElementById("refresh").addEventListener("click",init);
 init();
-</script></body></html>
+</script>
+</body>
+</html>
