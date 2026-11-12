@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><style id="claude-safe-area">body{border-bottom:env(safe-area-inset-bottom,0px) solid transparent}</style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capitola Storm Risk — 10-Day Heat Map</title>
+<style>
+  :root{
+    --bg:#0d1520; --panel:#142030; --line:#22324a; --text:#e6edf5; --muted:#8fa3bb;
+    --r0:#1a2738; --r1:#3b82f6; --r2:#22c55e; --r3:#facc15; --r4:#f97316; --r5:#ef4444;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{padding:16px 16px 8px}
+  h1{font-size:19px;margin:0 0 2px;letter-spacing:.2px}
+  .sub{color:var(--muted);font-size:12.5px}
+  .banner{margin:10px 16px 0;padding:9px 12px;border-radius:8px;font-size:12.5px;display:none}
+  .banner.sample{display:block;background:#3a2a0a;border:1px solid #7a5a12;color:#ffd98a}
+  .banner.live{display:block;background:#0f2a1c;border:1px solid #1f6b43;color:#9fe8bf}
+  .legend{display:flex;flex-wrap:wrap;gap:6px 12px;padding:10px 16px;font-size:12px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .sw{width:14px;height:14px;border-radius:3px;display:inline-block;border:1px solid #2c3d55}
+  .wrap{overflow-x:auto;margin:0 0 0 0;padding:0 16px 8px;-webkit-overflow-scrolling:touch}
+  table{border-collapse:separate;border-spacing:3px;min-width:100%}
+  th,td{text-align:center}
+  thead th{font-weight:600;font-size:12px;padding:4px 2px;color:var(--text);min-width:64px}
+  thead th .dow{display:block;font-size:13px}
+  thead th .dt{display:block;color:var(--muted);font-weight:500;font-size:11px}
+  thead th.lowconf .dt::after{content:" ·low conf";color:#b08a4a}
+  th.rowh{position:sticky;left:0;z-index:2;background:var(--bg);text-align:left;min-width:104px;max-width:118px;padding:0 6px 0 0;font-size:12px;font-weight:600}
+  th.rowh small{display:block;color:var(--muted);font-weight:400;font-size:10.5px}
+  td.cell{border-radius:6px;height:46px;padding:3px 2px;cursor:pointer;font-size:12.5px;font-weight:600;transition:transform .08s}
+  td.cell:active{transform:scale(.96)}
+  td.cell small{display:block;font-size:10px;font-weight:500;opacity:.85}
+  td.cell.sel{outline:2px solid #fff;outline-offset:-2px}
+  .l0{background:var(--r0);color:#9fb2c8}
+  .l1{background:var(--r1);color:#fff}
+  .l2{background:var(--r2);color:#06210f}
+  .l3{background:var(--r3);color:#2a2200}
+  .l4{background:var(--r4);color:#2a1100}
+  .l5{background:var(--r5);color:#fff}
+  .lowconfcol{opacity:.82}
+  tr.sep td,tr.sep th{height:6px;padding:0}
+  tr.total th.rowh{font-size:13px}
+  tr.total td.cell{height:58px;font-size:13px;border:2px solid rgba(255,255,255,.18)}
+  tr.total td.cell .lvl{display:block;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+  #detail{margin:6px 16px 0;padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:10px;font-size:13px;min-height:52px}
+  #detail b{color:#fff}
+  #detail .thr{color:var(--muted);font-size:12px;margin-top:4px}
+  .notes{padding:12px 16px 28px;color:var(--muted);font-size:12px}
+  .notes h3{color:var(--text);font-size:13px;margin:14px 0 4px}
+  .notes ul{margin:4px 0;padding-left:18px}
+  button{background:#1f3049;color:var(--text);border:1px solid #2f4566;border-radius:7px;padding:6px 10px;font-size:12.5px}
+  .bar{display:flex;gap:8px;align-items:center;padding:0 16px;flex-wrap:wrap}
+  a{color:#8cc4ff}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<header>
+  <h1>Capitola / Santa Cruz — Storm Risk</h1>
+  <div class="sub" id="updated">Loading forecast…</div>
+</header>
+<div class="bar"><button id="refresh">Refresh</button><button id="copycode">Copy tool code</button><span class="sub">Tap any box for details and thresholds.</span></div>
+<div class="banner" id="banner"></div>
+<div class="legend">
+  <span><i class="sw" style="background:var(--r0)"></i>None</span>
+  <span><i class="sw" style="background:var(--r1)"></i>Low</span>
+  <span><i class="sw" style="background:var(--r2)"></i>Med-low</span>
+  <span><i class="sw" style="background:var(--r3)"></i>Medium</span>
+  <span><i class="sw" style="background:var(--r4)"></i>Med-high</span>
+  <span><i class="sw" style="background:var(--r5)"></i>High</span>
+</div>
+<div class="wrap"><table id="grid"></table></div>
+<div id="detail">Tap a box to see what drives its color.</div>
+
+<div class="notes">
+  <h3>How the overall risk is calculated</h3>
+  <ul>
+    <li>Starts at the <b>highest</b> category in that day's column.</li>
+    <li><b>+1 level</b> if two or more categories are orange or red the same day (stacked threats).</li>
+    <li><b>+1 level</b> for the coastal-flood combo: high tide at medium or above <i>and</i> waves or swell at medium or above.</li>
+    <li>Capped at High. Days 8–10 are marked low confidence: wave and rain forecasts lose skill that far out.</li>
+  </ul>
+  <h3>Data sources (free, no key)</h3>
+  <ul>
+    <li>Rain, wind, gusts, pressure, CAPE: <a href="https://open-meteo.com/en/docs">Open-Meteo Forecast API</a></li>
+    <li>Waves, swell: <a href="https://open-meteo.com/en/docs/marine-weather-api">Open-Meteo Marine API</a></li>
+    <li>Tides: <a href="https://tidesandcurrents.noaa.gov/api/">NOAA CO-OPS</a> station 9413745 (Santa Cruz), MLLW. Falls back to Open-Meteo sea level if NOAA is unreachable.</li>
+  </ul>
+  <h3>Caveats</h3>
+  <ul>
+    <li>Tide is the <i>predicted astronomical</i> tide. Storm surge adds to it; watch NWS coastal flood alerts on big days.</li>
+    <li>Wave model point is just offshore of Capitola; open-ocean breaks run larger.</li>
+    <li>Thresholds are tuned for Capitola's south-facing exposure and are a starting point. Adjust the <code>RULES</code> table in the file to taste.</li>
+  </ul>
+</div>
+
+<script>
+const LAT = 36.9719, LON = -121.953;          // Capitola Village
+const MLAT = 36.95,  MLON = -121.95;          // just offshore, for wave model
+const TIDE_STATION = "9413745";               // NOAA Santa Cruz, Monterey Bay
+const TZ = "America/Los_Angeles";
+const DAYS = 10;
+const M2FT = 3.28084;
+const LEVEL_NAMES = ["None","Low","Med-low","Medium","Med-high","High"];
+
+// Thresholds: value >= t[i] -> level i+1
+const RULES = [
+  {key:"rain",   label:"Rain total",     unit:"in/day", t:[0.1,0.5,1,2,3],
+    fmt:d=>d.rain.toFixed(2)+'"', sub:d=>d.rainPct!=null? d.rainPct+"%":"" ,
+    help:"Daily precipitation total."},
+  {key:"wind",   label:"Wind speed",     unit:"mph sustained max", t:[15,20,25,35,45],
+    fmt:d=>Math.round(d.wind), sub:d=>"mph "+compass(d.windDir),
+    help:"Highest sustained wind of the day."},
+  {key:"gust",   label:"Wind gusts",     unit:"mph max", t:[25,35,45,55,65],
+    fmt:d=>Math.round(d.gust), sub:()=>"mph",
+    help:"Peak gust. Gusts do most of the tree and power-line damage."},
+  {key:"onshore",label:"Onshore wind",   unit:"S/SE/SW wind, mph", t:[10,15,20,30,40],
+    val:d=>isOnshore(d.windDir)? d.wind : 0,
+    fmt:d=>isOnshore(d.windDir)? Math.round(d.wind) : "off", sub:d=>compass(d.windDir),
+    help:"Capitola faces south. Winds from roughly ESE to WSW push water and waves into the beach and village. Offshore winds score zero."},
+  {key:"wave",   label:"Wave height",    unit:"ft, combined max", t:[4,6,9,12,16],
+    fmt:d=>d.wave.toFixed(1), sub:()=>"ft",
+    help:"Combined significant wave height (wind waves + swell)."},
+  {key:"swell",  label:"Swell power",    unit:"height² × period", t:[200,400,700,1200,2000],
+    val:d=>d.swellH*d.swellH*d.swellT,
+    fmt:d=>d.swellH.toFixed(1)+"ft", sub:d=>Math.round(d.swellT)+"s "+compass(d.swellDir),
+    help:"Swell energy grows with height squared times period, so a 6 ft 18 s swell hits far harder than 6 ft 8 s. Index = ft² × seconds."},
+  {key:"tide",   label:"High tide",      unit:"ft MLLW", t:[5.5,6,6.5,7,7.5],
+    fmt:d=>d.tide!=null? d.tide.toFixed(1) : "–", sub:d=>d.tideTime||"ft",
+    help:"Highest predicted tide of the day. Around 7 ft is king-tide territory at Santa Cruz; storm surge adds on top."},
+  {key:"press",  label:"Low pressure",   unit:"hPa daily min", t:[-1010,-1005,-1000,-995,-985],
+    val:d=>-d.pmin,
+    fmt:d=>Math.round(d.pmin), sub:()=>"hPa",
+    help:"Lowest sea-level pressure. Deeper lows mean stronger storms and a little extra water (about 1 cm per hPa below normal)."},
+  {key:"pdrop",  label:"Pressure drop",  unit:"hPa fall in 24 h", t:[3,6,10,15,20],
+    fmt:d=>d.pdrop.toFixed(0), sub:()=>"hPa/24h",
+    help:"Fastest 24-hour pressure fall during the day. Rapid drops signal an intensifying storm."},
+  {key:"cape",   label:"T-storm energy", unit:"CAPE J/kg max", t:[100,300,600,1000,1500],
+    fmt:d=>Math.round(d.cape), sub:()=>"J/kg",
+    help:"Convective energy available for thunderstorms: lightning, downbursts, waterspouts."},
+];
+
+function levelFor(rule, d){
+  const v = rule.val ? rule.val(d) : d[rule.key];
+  if (v==null || isNaN(v)) return 0;
+  let l=0; rule.t.forEach((th,i)=>{ if (v>=th) l=i+1; }); return l;
+}
+function isOnshore(dir){ return dir!=null && dir>=100 && dir<=255; }
+function compass(deg){
+  if (deg==null||isNaN(deg)) return "";
+  return ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"][Math.round(deg/22.5)%16];
+}
+function ymd(d){ return d.toISOString().slice(0,10); }
+
+// ---------- live data ----------
+async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(r.status); return r.json(); }
+
+async function loadLive(){
+  const wx = await getJSON(`https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}`+
+    `&daily=precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant`+
+    `&hourly=pressure_msl,cape&past_days=1&forecast_days=${DAYS}&timezone=${encodeURIComponent(TZ)}&wind_speed_unit=mph&precipitation_unit=inch`);
+  const mar = await getJSON(`https://marine-api.open-meteo.com/v1/marine?latitude=${MLAT}&longitude=${MLON}`+
+    `&daily=wave_height_max,swell_wave_height_max,swell_wave_period_max,swell_wave_direction_dominant`+
+    `&hourly=sea_level_height_msl&past_days=1&forecast_days=${DAYS}&timezone=${encodeURIComponent(TZ)}`);
+  let tides=null, tideSrc="NOAA";
+  try{
+    const today = new Date().toLocaleDateString("en-CA",{timeZone:TZ}).replace(/-/g,"");
+    const t = await getJSON(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&application=storm_heatmap`+
+      `&station=${TIDE_STATION}&begin_date=${today}&range=${DAYS*24+24}&datum=MLLW&interval=hilo&units=english&time_zone=lst_ldt&format=json`);
+    if(!t.predictions) throw new Error("no preds");
+    tides = {};
+    t.predictions.filter(p=>p.type==="H").forEach(p=>{
+      const day=p.t.slice(0,10), v=parseFloat(p.v);
+      if(!tides[day] || v>tides[day].v) tides[day]={v, time:fmtTime(p.t.slice(11,16))};
+    });
+  }catch(e){ tideSrc="Open-Meteo sea level (approx.)"; }
+
+  // hourly helpers
+  const hp = wx.hourly.time, P = wx.hourly.pressure_msl, C = wx.hourly.cape;
+  const byDay = {};
+  hp.forEach((t,i)=>{
+    const day=t.slice(0,10); (byDay[day] ||= {p:[],c:[],drop:[]});
+    if(P[i]!=null) byDay[day].p.push(P[i]);
+    if(C[i]!=null) byDay[day].c.push(C[i]);
+    if(i>=24 && P[i]!=null && P[i-24]!=null) byDay[day].drop.push(P[i-24]-P[i]);
+  });
+  const sl = {};
+  mar.hourly.time.forEach((t,i)=>{
+    const v=mar.hourly.sea_level_height_msl?.[i]; if(v==null) return;
+    const day=t.slice(0,10), ft=v*M2FT+2.9;   // MSL→approx MLLW at Santa Cruz
+    if(!sl[day]||ft>sl[day].v) sl[day]={v:ft,time:fmtTime(t.slice(11,16))};
+  });
+
+  const todayStr = new Date().toLocaleDateString("en-CA",{timeZone:TZ});
+  const out=[];
+  wx.daily.time.forEach((day,i)=>{
+    if(day<todayStr || out.length>=DAYS) return;
+    const mi = mar.daily.time.indexOf(day), h=byDay[day]||{p:[],c:[],drop:[]};
+    const tt = tides? tides[day] : sl[day];
+    out.push({
+      date:day,
+      rain: wx.daily.precipitation_sum[i] ?? 0,
+      rainPct: wx.daily.precipitation_probability_max?.[i],
+      wind: wx.daily.wind_speed_10m_max[i] ?? 0,
+      gust: wx.daily.wind_gusts_10m_max[i] ?? 0,
+      windDir: wx.daily.wind_direction_10m_dominant[i],
+      wave: mi>=0 ? (mar.daily.wave_height_max[mi]??0)*M2FT : 0,
+      swellH: mi>=0 ? (mar.daily.swell_wave_height_max[mi]??0)*M2FT : 0,
+      swellT: mi>=0 ? (mar.daily.swell_wave_period_max[mi]??0) : 0,
+      swellDir: mi>=0 ? mar.daily.swell_wave_direction_dominant[mi] : null,
+      tide: tt? tt.v : null, tideTime: tt? tt.time : null,
+      pmin: h.p.length? Math.min(...h.p) : 1015,
+      pdrop: h.drop.length? Math.max(0,...h.drop) : 0,
+      cape: h.c.length? Math.max(...h.c) : 0,
+    });
+  });
+  return {days:out, tideSrc};
+}
+function fmtTime(hm){ let [h,m]=hm.split(":").map(Number); const ap=h>=12?"p":"a"; h=h%12||12; return h+":"+String(m).padStart(2,"0")+ap; }
+
+// ---------- sample data (used when live fetch is blocked) ----------
+function sampleData(){
+  const base = new Date(); const out=[];
+  const storm=[0,0.1,0.35,0.8,1,0.6,0.25,0.1,0.3,0.15]; // a storm peaking on day 5
+  for(let i=0;i<DAYS;i++){
+    const d=new Date(base); d.setDate(base.getDate()+i); const s=storm[i];
+    out.push({
+      date: d.toLocaleDateString("en-CA",{timeZone:TZ}),
+      rain: +(s*2.6).toFixed(2), rainPct: Math.round(10+s*85),
+      wind: 8+s*34, gust: 14+s*52, windDir: s>0.3? 200 : 320,
+      wave: 3+s*12, swellH: 3.5+s*9, swellT: 10+s*8, swellDir: 265,
+      tide: 5.2+ (i>=3&&i<=6? 1.6 : 0.4) , tideTime: ["8:12a","8:51a","9:33a","10:18a","11:06a","11:59a","12:55p","1:54p","2:51p","3:44p"][i],
+      pmin: 1018-s*30, pdrop: s*16, cape: s*450,
+    });
+  }
+  return {days:out, tideSrc:"sample"};
+}
+
+// ---------- render ----------
+let state=null, selected=null;
+function overall(d){
+  const lv = RULES.map(r=>levelFor(r,d));
+  let o = Math.max(...lv), why=[];
+  RULES.forEach((r,i)=>{ if(lv[i]===o && o>0) why.push(r.label); });
+  const hot = lv.filter(l=>l>=4).length;
+  const reasons=[];
+  if (hot>=2){ o++; reasons.push(hot+" categories orange/red"); }
+  const L = k=>lv[RULES.findIndex(r=>r.key===k)];
+  if (L("tide")>=3 && (L("wave")>=3 || L("swell")>=3)){ o++; reasons.push("high tide + big surf"); }
+  return {level:Math.min(5,o), base:Math.max(...lv), why, reasons};
+}
+
+function render(){
+  const g=document.getElementById("grid"); const days=state.days;
+  let h="<thead><tr><th class='rowh'></th>";
+  days.forEach((d,i)=>{
+    const dt=new Date(d.date+"T12:00:00");
+    const dow = i===0? "Today" : dt.toLocaleDateString("en-US",{weekday:"short"});
+    h+=`<th class="${i>=7?'lowconf':''}"><span class="dow">${dow}</span><span class="dt">${dt.getMonth()+1}/${dt.getDate()}</span></th>`;
+  });
+  h+="</tr></thead><tbody>";
+  RULES.forEach((r,ri)=>{
+    h+=`<tr><th class="rowh">${r.label}<small>${r.unit}</small></th>`;
+    days.forEach((d,di)=>{
+      const l=levelFor(r,d);
+      h+=`<td class="cell l${l} ${di>=7?'lowconfcol':''}" data-r="${ri}" data-d="${di}">${r.fmt(d)}<small>${r.sub(d)}</small></td>`;
+    });
+    h+="</tr>";
+  });
+  h+=`<tr class="sep"><th class="rowh"></th>${days.map(()=>"<td></td>").join("")}</tr>`;
+  h+=`<tr class="total"><th class="rowh">OVERALL RISK</th>`;
+  days.forEach((d,di)=>{
+    const o=overall(d);
+    h+=`<td class="cell l${o.level} ${di>=7?'lowconfcol':''}" data-r="total" data-d="${di}">${o.level}<span class="lvl">${LEVEL_NAMES[o.level]}</span></td>`;
+  });
+  h+="</tr></tbody>";
+  g.innerHTML=h;
+  g.querySelectorAll("td.cell").forEach(td=>td.addEventListener("click",()=>showDetail(td)));
+}
+
+function showDetail(td){
+  if(selected) selected.classList.remove("sel"); selected=td; td.classList.add("sel");
+  const d=state.days[+td.dataset.d];
+  const dt=new Date(d.date+"T12:00:00").toLocaleDateString("en-US",{weekday:"long",month:"short",day:"numeric"});
+  const box=document.getElementById("detail");
+  if(td.dataset.r==="total"){
+    const o=overall(d);
+    box.innerHTML=`<b>${dt} — Overall: ${LEVEL_NAMES[o.level]}</b><br>`+
+      (o.base===0? "No category shows risk." : `Highest category: ${LEVEL_NAMES[o.base]} from ${o.why.join(", ")}.`)+
+      (o.reasons.length? `<br>Bumped up for: ${o.reasons.join("; ")}.` : "")+
+      (+td.dataset.d>=7? `<div class="thr">Day ${+td.dataset.d+1}: low forecast confidence.</div>`:"");
+    return;
+  }
+  const r=RULES[+td.dataset.r], l=levelFor(r,d);
+  const neg = r.t[0]<0;
+  const thr = r.t.map((t,i)=>`${LEVEL_NAMES[i+1]} ${neg?"≤ "+(-t):"≥ "+t}`).join(" · ");
+  box.innerHTML=`<b>${r.label} — ${dt}: ${LEVEL_NAMES[l]}</b><br>${r.help}`+
+    (r.key==="tide"&&state.tideSrc!=="NOAA"? `<br><i>Tide source: ${state.tideSrc}.</i>`:"")+
+    `<div class="thr">Thresholds (${r.unit}): ${thr}</div>`;
+}
+
+async function init(){
+  const banner=document.getElementById("banner"), up=document.getElementById("updated");
+  up.textContent="Loading forecast…";
+  try{
+    state = await loadLive();
+    if(!state.days.length) throw new Error("empty");
+    banner.className="banner live";
+    banner.textContent="Live forecast loaded. Tides: "+state.tideSrc+".";
+    up.textContent="Updated "+new Date().toLocaleString("en-US",{weekday:"short",hour:"numeric",minute:"2-digit"})+" · Capitola Village, 36.97°N 121.95°W";
+  }catch(e){
+    state = sampleData();
+    banner.className="banner sample";
+    banner.innerHTML="<b>Sample data</b>: this viewer blocks live data requests, so an example storm is shown. Open this file directly in Safari or Chrome to load the real forecast.";
+    up.textContent="Sample storm scenario · layout preview";
+  }
+  render();
+}
+const SOURCE = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+document.getElementById("copycode").addEventListener("click", async e=>{
+  const b=e.currentTarget;
+  try{ await navigator.clipboard.writeText(SOURCE); b.textContent="Copied ✓"; }
+  catch(err){ b.textContent="Copy blocked"; }
+  setTimeout(()=>b.textContent="Copy tool code",2500);
+});
+document.getElementById("refresh").addEventListener("click",init);
+init();
+</script></body></html>
