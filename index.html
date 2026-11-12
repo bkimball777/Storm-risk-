@@ -78,7 +78,7 @@
   <ul>
     <li>Starts at the <b>highest</b> category in that day's column.</li>
     <li><b>+1 level</b> if two or more categories are orange or red the same day (stacked threats).</li>
-    <li><b>+1 level</b> for the coastal-flood combo: high tide at medium or above <i>and</i> waves or swell at medium or above.</li>
+    <li><b>+1 level</b> for the coastal-flood combo: high tide at low (5 ft) or above <i>and</i> waves or swell at med-high or above.</li>
     <li>Capped at High. Days 8–10 are marked low confidence: wave and rain forecasts lose skill that far out.</li>
   </ul>
   <h3>Data sources (free, no key)</h3>
@@ -129,9 +129,9 @@ const RULES = [
     val:d=>d.swellH*d.swellH*d.swellT,
     fmt:d=>d.swellH.toFixed(1)+"ft", sub:d=>Math.round(d.swellT)+"s "+compass(d.swellDir),
     help:"Swell energy grows with height squared times period, so a 6 ft 18 s swell hits far harder than 6 ft 8 s. Index = ft² × seconds."},
-  {key:"tide",   label:"High tide",      unit:"ft MLLW", t:[5.5,6,6.5,7,7.5],
+  {key:"tide",   label:"High tide",      unit:"ft MLLW", t:[5,5.5,6,6.5,7],
     fmt:d=>d.tide!=null? d.tide.toFixed(1) : "–", sub:d=>d.tideTime||"ft",
-    help:"Highest predicted tide of the day. Around 7 ft is king-tide territory at Santa Cruz; storm surge adds on top."},
+    help:"Highest predicted tide of the day. Tide sets the water level waves run up from, so even an ordinary 5 ft high tide matters when surf is big. Around 7 ft is king-tide territory; storm surge adds on top."},
   {key:"press",  label:"Low pressure",   unit:"hPa daily min", t:[-1010,-1005,-1000,-995,-985],
     val:d=>-d.pmin,
     fmt:d=>Math.round(d.pmin), sub:()=>"hPa",
@@ -254,7 +254,7 @@ function overall(d){
   const reasons=[];
   if (hot>=2){ o++; reasons.push(hot+" categories orange/red"); }
   const L = k=>lv[RULES.findIndex(r=>r.key===k)];
-  if (L("tide")>=3 && (L("wave")>=3 || L("swell")>=3)){ o++; reasons.push("high tide + big surf"); }
+  if (L("tide")>=1 && (L("wave")>=4 || L("swell")>=4)){ o++; reasons.push("high tide + big surf"); }
   return {level:Math.min(5,o), base:Math.max(...lv), why, reasons};
 }
 
