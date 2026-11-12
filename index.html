@@ -77,8 +77,9 @@
   <h3>How the overall risk is calculated</h3>
   <ul>
     <li>Starts at the <b>highest</b> category in that day's column.</li>
-    <li><b>+1 level</b> if two or more categories are orange or red the same day (stacked threats).</li>
+    <li><b>+1 level</b> for stacked threats: two or more <i>separate forces</i> at med-high or worse the same day. Rows are grouped so one force isn't counted twice: Surf (waves, swell), Wind (speed, gusts, onshore), Storm strength (low pressure, pressure drop), Water level (tide), Rain.</li>
     <li><b>+1 level</b> for the coastal-flood combo: high tide at low (5 ft) or above <i>and</i> waves or swell at med-high or above.</li>
+    <li>Thunderstorm energy is shown for awareness but is not scored, since it does not add to ocean power.</li>
     <li>Capped at High. Days 8–10 are marked low confidence: wave and rain forecasts lose skill that far out.</li>
   </ul>
   <h3>Data sources (free, no key)</h3>
@@ -111,37 +112,46 @@ const LEVEL_NAMES = ["None","Low","Med-low","Medium","Med-high","High"];
 const RULES = [
   {key:"rain",   label:"Rain total",     unit:"in/day", t:[0.1,0.5,1,2,3],
     fmt:d=>d.rain.toFixed(2)+'"', sub:d=>d.rainPct!=null? d.rainPct+"%":"" ,
-    help:"Daily precipitation total."},
+    help:"Daily precipitation total.", group:"Rain",
+    mean:d=>`${d.rain.toFixed(2)}" of rain. Heavy rain floods low streets and swells Soquel Creek, which drains right through the village. If the creek is running high at high tide, it can back up.`},
   {key:"wind",   label:"Wind speed",     unit:"mph sustained max", t:[15,20,25,35,45],
     fmt:d=>Math.round(d.wind), sub:d=>"mph "+compass(d.windDir),
-    help:"Highest sustained wind of the day."},
+    help:"Highest sustained wind of the day.", group:"Wind",
+    mean:d=>`Sustained wind up to ${Math.round(d.wind)} mph. Strong steady wind builds rough, choppy seas on top of the swell and stresses trees.`},
   {key:"gust",   label:"Wind gusts",     unit:"mph max", t:[25,35,45,55,65],
     fmt:d=>Math.round(d.gust), sub:()=>"mph",
-    help:"Peak gust. Gusts do most of the tree and power-line damage."},
+    help:"Peak gust. Gusts do most of the tree and power-line damage.", group:"Wind",
+    mean:d=>`Gusts to ${Math.round(d.gust)} mph. Gusts snap branches and bring down power lines; above about 45 mph, outages become likely.`},
   {key:"onshore",label:"Onshore wind",   unit:"S/SE/SW wind, mph", t:[10,15,20,30,40],
     val:d=>isOnshore(d.windDir)? d.wind : 0,
     fmt:d=>isOnshore(d.windDir)? Math.round(d.wind) : "off", sub:d=>compass(d.windDir),
-    help:"Capitola faces south. Winds from roughly ESE to WSW push water and waves into the beach and village. Offshore winds score zero."},
+    help:"Capitola faces south. Winds from roughly ESE to WSW push water and waves into the beach and village. Offshore winds score zero.", group:"Wind",
+    mean:d=>`${Math.round(d.wind)} mph wind from the ${compass(d.windDir)}, blowing straight into Capitola. Onshore wind piles water against the shore and drives waves farther up the beach.`},
   {key:"wave",   label:"Wave height",    unit:"ft, combined max", t:[4,6,9,12,16],
     fmt:d=>d.wave.toFixed(1), sub:()=>"ft",
-    help:"Combined significant wave height (wind waves + swell)."},
+    help:"Combined significant wave height (wind waves + swell).", group:"Surf",
+    mean:d=>`Waves up to ${d.wave.toFixed(1)} ft offshore. Bigger waves run farther up the beach and can break over the seawall onto the Esplanade.`},
   {key:"swell",  label:"Swell power",    unit:"height² × period", t:[200,400,700,1200,2000],
     val:d=>d.swellH*d.swellH*d.swellT,
     fmt:d=>d.swellH.toFixed(1)+"ft", sub:d=>Math.round(d.swellT)+"s "+compass(d.swellDir),
-    help:"Swell energy grows with height squared times period, so a 6 ft 18 s swell hits far harder than 6 ft 8 s. Index = ft² × seconds."},
+    help:"Swell energy grows with height squared times period, so a 6 ft 18 s swell hits far harder than 6 ft 8 s. Index = ft² × seconds.", group:"Surf",
+    mean:d=>`${d.swellH.toFixed(1)} ft swell at ${Math.round(d.swellT)} seconds from the ${compass(d.swellDir)}. ${d.swellT>=14?"That is long-period swell, which carries far more energy than its height suggests and surges hard into the beach, pier and wharf.":"Swell this size pounds the beach and wharf; the longer the period, the harder it hits."}`},
   {key:"tide",   label:"High tide",      unit:"ft MLLW", t:[5,5.5,6,6.5,7],
     fmt:d=>d.tide!=null? d.tide.toFixed(1) : "–", sub:d=>d.tideTime||"ft",
-    help:"Highest predicted tide of the day. Tide sets the water level waves run up from, so even an ordinary 5 ft high tide matters when surf is big. Around 7 ft is king-tide territory; storm surge adds on top."},
+    help:"Highest predicted tide of the day. Tide sets the water level waves run up from, so even an ordinary 5 ft high tide matters when surf is big. Around 7 ft is king-tide territory; storm surge adds on top.", group:"Water level",
+    mean:d=>`High tide of ${d.tide!=null?d.tide.toFixed(1):"?"} ft${d.tideTime?" at "+d.tideTime:""}. The tide sets the starting water level for the waves: the higher it is, the more wave run-up reaches the village.`},
   {key:"press",  label:"Low pressure",   unit:"hPa daily min", t:[-1010,-1005,-1000,-995,-985],
     val:d=>-d.pmin,
     fmt:d=>Math.round(d.pmin), sub:()=>"hPa",
-    help:"Lowest sea-level pressure. Deeper lows mean stronger storms and a little extra water (about 1 cm per hPa below normal)."},
+    help:"Lowest sea-level pressure. Deeper lows mean stronger storms and a little extra water (about 1 cm per hPa below normal).", group:"Storm strength",
+    mean:d=>`Pressure down to ${Math.round(d.pmin)} hPa, a deep low. Deep lows drive stronger winds, and the low pressure itself lifts sea level by about ${Math.max(0,(1013-d.pmin)*0.39).toFixed(0)} inches on top of the tide.`},
   {key:"pdrop",  label:"Pressure drop",  unit:"hPa fall in 24 h", t:[3,6,10,15,20],
     fmt:d=>d.pdrop.toFixed(0), sub:()=>"hPa/24h",
-    help:"Fastest 24-hour pressure fall during the day. Rapid drops signal an intensifying storm."},
+    help:"Fastest 24-hour pressure fall during the day. Rapid drops signal an intensifying storm.", group:"Storm strength",
+    mean:d=>`Pressure falling ${d.pdrop.toFixed(0)} hPa in 24 hours. A fast drop means the storm is strengthening as it arrives, and wind and seas usually ramp up quickly.`},
   {key:"cape",   label:"T-storm energy", unit:"CAPE J/kg max", t:[100,300,600,1000,1500],
     fmt:d=>Math.round(d.cape), sub:()=>"J/kg",
-    help:"Convective energy available for thunderstorms: lightning, downbursts, waterspouts."},
+    help:"Convective energy available for thunderstorms: lightning, downbursts, waterspouts. Shown for awareness only; it does not drive ocean power, so it is not part of the overall risk.", group:"Thunderstorms", score:false},
 ];
 
 function levelFor(rule, d){
@@ -246,16 +256,19 @@ function sampleData(){
 
 // ---------- render ----------
 let state=null, selected=null;
+const SCORED = RULES.filter(r=>r.score!==false);
 function overall(d){
-  const lv = RULES.map(r=>levelFor(r,d));
-  let o = Math.max(...lv), why=[];
-  RULES.forEach((r,i)=>{ if(lv[i]===o && o>0) why.push(r.label); });
-  const hot = lv.filter(l=>l>=4).length;
-  const reasons=[];
-  if (hot>=2){ o++; reasons.push(hot+" categories orange/red"); }
-  const L = k=>lv[RULES.findIndex(r=>r.key===k)];
-  if (L("tide")>=1 && (L("wave")>=4 || L("swell")>=4)){ o++; reasons.push("high tide + big surf"); }
-  return {level:Math.min(5,o), base:Math.max(...lv), why, reasons};
+  const rows = SCORED.map(r=>({r, l:levelFor(r,d)}));
+  const base = Math.max(0,...rows.map(x=>x.l));
+  const gmax = {}; rows.forEach(x=>{ gmax[x.r.group]=Math.max(gmax[x.r.group]||0,x.l); });
+  let o = base; const reasons=[];
+  const hot = Object.keys(gmax).filter(g=>gmax[g]>=4);
+  if (hot.length>=2){ o++; reasons.push(`Stacked threats (+1): ${hot.join(" and ")} are both at med-high or worse, separate forces hitting at once.`); }
+  const lv = k=>rows.find(x=>x.r.key===k).l;
+  if (lv("tide")>=1 && gmax["Surf"]>=4){ o++; reasons.push(`Flood combo (+1): big surf arriving on a ${d.tide.toFixed(1)} ft high tide. Waves start from a higher water level and reach farther into the village.`); }
+  let main = rows.filter(x=>x.l>=3).sort((a,b)=>b.l-a.l);
+  if(!main.length) main = rows.filter(x=>x.l>=1).sort((a,b)=>b.l-a.l).slice(0,2);
+  return {level:Math.min(5,o), base, reasons, main};
 }
 
 function render(){
@@ -268,7 +281,7 @@ function render(){
   });
   h+="</tr></thead><tbody>";
   RULES.forEach((r,ri)=>{
-    h+=`<tr><th class="rowh">${r.label}<small>${r.unit}</small></th>`;
+    h+=`<tr><th class="rowh">${r.label}<small>${r.unit}${r.score===false?" · not scored":""}</small></th>`;
     days.forEach((d,di)=>{
       const l=levelFor(r,d);
       h+=`<td class="cell l${l} ${di>=7?'lowconfcol':''}" data-r="${ri}" data-d="${di}">${r.fmt(d)}<small>${r.sub(d)}</small></td>`;
@@ -293,10 +306,17 @@ function showDetail(td){
   const box=document.getElementById("detail");
   if(td.dataset.r==="total"){
     const o=overall(d);
-    box.innerHTML=`<b>${dt} — Overall: ${LEVEL_NAMES[o.level]}</b><br>`+
-      (o.base===0? "No category shows risk." : `Highest category: ${LEVEL_NAMES[o.base]} from ${o.why.join(", ")}.`)+
-      (o.reasons.length? `<br>Bumped up for: ${o.reasons.join("; ")}.` : "")+
-      (+td.dataset.d>=7? `<div class="thr">Day ${+td.dataset.d+1}: low forecast confidence.</div>`:"");
+    let html=`<b>${dt} — Overall: ${LEVEL_NAMES[o.level]}</b>`;
+    if(o.base===0){ html+="<br>No storm or ocean factor shows risk today."; }
+    else{
+      html+=`<div style="margin-top:8px;font-weight:600">Main factors</div>`;
+      html+=o.main.map(x=>`<div style="margin:6px 0;display:flex;gap:8px;align-items:flex-start">`+
+        `<span class="l${x.l}" style="flex:none;border-radius:4px;padding:1px 6px;font-size:11px;font-weight:700">${LEVEL_NAMES[x.l]}</span>`+
+        `<span><b>${x.r.label}:</b> ${x.r.mean(d)}</span></div>`).join("");
+      if(o.reasons.length) html+=`<div style="margin-top:8px;font-weight:600">Why it was raised</div>`+o.reasons.map(t=>`<div style="margin:4px 0">${t}</div>`).join("");
+    }
+    if(+td.dataset.d>=7) html+=`<div class="thr">Day ${+td.dataset.d+1}: low forecast confidence.</div>`;
+    box.innerHTML=html;
     return;
   }
   const r=RULES[+td.dataset.r], l=levelFor(r,d);
@@ -325,7 +345,7 @@ async function init(){
   }
   render();
 }
-const SOURCE_FALLBACK = (()=>{
+const SOURCE_FALLBACK = (()=>{ try {
   // Rebuild a clean copy, dropping anything the hosting page injected.
   const root = document.documentElement.cloneNode(true);
   const head = root.querySelector("head"), body = root.querySelector("body");
@@ -342,7 +362,7 @@ const SOURCE_FALLBACK = (()=>{
   });
   root.querySelectorAll("*").forEach(el=>[...el.attributes].forEach(a=>{ if(/^data-claude|^data-artifact/.test(a.name)) el.removeAttribute(a.name); }));
   return "<!DOCTYPE html>\n" + root.outerHTML;
-})();
+} catch(e){ return ""; } })();
 let SOURCE = null;
 fetch("index.html").then(r=>r.ok?r.text():null).then(t=>{ if(t && t.includes("Capitola")) SOURCE=t; }).catch(()=>{});
 document.getElementById("copycode").addEventListener("click", async e=>{
